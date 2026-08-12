@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+"""yd — interactive sequential yt-dlp queue with a persistent URL prompt.
+
+Queue mode:
+    yd
+
+One-shot mode:
+    yd "https://example.com/video"
+    yd -x --audio-format mp3 "https://example.com/video"
+"""
+
+from __future__ import annotations
+
+import curses
+import os
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
+from pathlib import Path
+from typing import Optional
+
+URL_RE = re.compile(r"""https?://[^\s<>"']+""", re.IGNORECASE)
+SENTINEL = object()
+
+
+def find_ytdlp() -> str:
+    found = shutil.which("yt-dlp")
+    if found:
+        return found
+
+    for candidate in (
+        Path.home() / ".local/bin/yt-dlp",
+        Path("/usr/local/bin/yt-dlp"),
+        Path("/usr/bin/yt-dlp"),
+    ):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+
+    raise FileNotFoundError(
+        "yt-dlp was not found in PATH, ~/.local/bin, /usr/local/bin, or /usr/bin."
+    )
+
+
+def extract_urls(text: str) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    for match in URL_RE.findall(text):
+        url = match.rstrip("),.;!?]}")
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+
+    return urls
+
+
+class QueueWorker:
+    def __init__(self, ytdlp: str, events: queue.Queue[tuple[str, object]]) -> None:
+        self.ytdlp = ytdlp
+        self.events = events
+        self.jobs: queue.Queue[object] = queue.Queue()
+        self.lock = threading.Lock()
+
+        self.current_process: Optional[subprocess.Popen[str]] = None
+        self.active_number: Optional[int] = None
+        self.active_url: Optional[str] = None
+
+        self.total_added = 0
+        self.finished = 0
+        self.failed = 0
+        self.accepting = True
+        self.abort_requested = False
+
+        self.thread = threading.Thread(target=self._run, name="yd-worker", daemon=True)
+        self.thread.start()
+
+    def add(self, url: str) -> int:
+        with self.lock:
+            self.total_added += 1
+            number = self.total_added
+        self.jobs.put((number, url))
+        self.events.put(("queued", (number, url)))
+        return number
+
+    def snapshot(self) -> dict[str, object]:
+        with self.lock:
+            return {
+                "active_number": self.active_number,
+                "active_url": self.active_url,
+                "waiting": self.jobs.qsize(),
+                "finished": self.finished,
+                "failed": self.failed,
+                "total": self.total_added,
+                "accepting": self.accepting,
+            }
+
+    def stop_accepting(self) -> None:
+        with self.lock:
+            self.accepting = False
+        self.events.put(("notice", "Input closed. Finishing the active download and queue."))
+
+    def is_complete(self) -> bool:
+        state = self.snapshot()
+        return (
+            not bool(state["accepting"])
+            and state["active_url"] is None
+            and int(state["waiting"]) == 0
+        )
+
+    def shutdown_when_done(self) -> None:
+        self.jobs.put(SENTINEL)
+
+    def abort(self) -> None:
+        self.abort_requested = True
+        with self.lock:
+            process = self.current_process
+            self.accepting = False
+
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            except ProcessLookupError:
+                pass
+
+        while True:
+            try:
+                item = self.jobs.get_nowait()
+            except queue.Empty:
+                break
+            else:
+                self.jobs.task_done()
+                if item is SENTINEL:
+                    break
+
+        self.jobs.put(SENTINEL)
+
+    def _run(self) -> None:
+        while True:
+            item = self.jobs.get()
+
+            if item is SENTINEL:
+                self.jobs.task_done()
+                return
+
+            number, url = item  # type: ignore[misc]
+
+            if self.abort_requested:
+                self.jobs.task_done()
+                continue
+
+            with self.lock:
+                self.active_number = number
+                self.active_url = url
+
+            self.events.put(("started", (number, url)))
+
+            try:
+                process = subprocess.Popen(
+                    [self.ytdlp, "--newline", "--", url],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                )
+
+                with self.lock:
+                    self.current_process = process
+
+                assert process.stdout is not None
+                for raw_line in process.stdout:
+                    line = raw_line.rstrip("\r\n")
+                    if line:
+                        self.events.put(("output", line))
+
+                return_code = process.wait()
+
+            except OSError as exc:
+                self.events.put(("output", f"ERROR: could not start yt-dlp: {exc}"))
+                return_code = 127
+
+            finally:
+                with self.lock:
+                    self.current_process = None
+                    self.active_number = None
+                    self.active_url = None
+
+            with self.lock:
+                self.finished += 1
+                if return_code != 0:
+                    self.failed += 1
+
+            self.events.put(("finished", (number, return_code)))
+            self.jobs.task_done()
+
+
+class QueueUI:
+    def __init__(self, screen: "curses._CursesWindow", ytdlp: str) -> None:
+        self.screen = screen
+        self.events: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.worker = QueueWorker(ytdlp, self.events)
+
+        self.logs: deque[str] = deque(maxlen=2000)
+        self.input_buffer = ""
+        self.message = "Paste a URL and press Enter. Downloads run one at a time."
+        self.exit_ready = False
+
+    def run(self) -> int:
+        curses.curs_set(1)
+        self.screen.keypad(True)
+        self.screen.timeout(100)
+
+        while True:
+            self._drain_events()
+
+            if self.worker.is_complete():
+                self.worker.shutdown_when_done()
+                self.worker.thread.join(timeout=2)
+                state = self.worker.snapshot()
+                self.message = (
+                    f"Queue complete: {state['finished']} finished, "
+                    f"{state['failed']} failed. Press any key to close."
+                )
+                self.exit_ready = True
+
+            self._draw()
+
+            try:
+                key = self.screen.get_wch()
+            except curses.error:
+                continue
+            except KeyboardInterrupt:
+                self.worker.abort()
+                return 130
+
+            if self.exit_ready:
+                return 0
+
+            if key == curses.KEY_RESIZE:
+                continue
+
+            if isinstance(key, str):
+                if key == "\x03":  # Ctrl+C
+                    self.worker.abort()
+                    return 130
+
+                if key in ("\n", "\r"):
+                    self._submit()
+                    continue
+
+                if key in ("\b", "\x7f"):
+                    self.input_buffer = self.input_buffer[:-1]
+                    continue
+
+                if key.isprintable():
+                    self.input_buffer += key
+                    continue
+
+            if key in (curses.KEY_BACKSPACE, 127, 8):
+                self.input_buffer = self.input_buffer[:-1]
+
+    def _submit(self) -> None:
+        entered = self.input_buffer.strip()
+        self.input_buffer = ""
+
+        if not entered:
+            return
+
+        lowered = entered.lower()
+
+        if lowered in {"q", "quit", "exit"}:
+            self.worker.stop_accepting()
+            self.message = "No more URLs accepted. Finishing the current queue."
+            return
+
+        if lowered in {"s", "status"}:
+            state = self.worker.snapshot()
+            active = state["active_url"] or "none"
+            self.message = (
+                f"Active: {active} | Waiting: {state['waiting']} | "
+                f"Finished: {state['finished']} | Failed: {state['failed']}"
+            )
+            return
+
+        if not bool(self.worker.snapshot()["accepting"]):
+            self.message = "The queue is closing and no longer accepts URLs."
+            return
+
+        urls = extract_urls(entered)
+        if not urls:
+            self.message = "No valid http:// or https:// URL was found."
+            return
+
+        numbers = [self.worker.add(url) for url in urls]
+        self.message = (
+            f"Queued {len(numbers)} URL(s): "
+            + ", ".join(f"#{number}" for number in numbers)
+        )
+
+    def _drain_events(self) -> None:
+        while True:
+            try:
+                event, payload = self.events.get_nowait()
+            except queue.Empty:
+                return
+
+            if event == "queued":
+                number, url = payload  # type: ignore[misc]
+                self.logs.append(f"[queue] #{number}: {url}")
+
+            elif event == "started":
+                number, url = payload  # type: ignore[misc]
+                self.logs.append("")
+                self.logs.append(f"[start] #{number}: {url}")
+
+            elif event == "output":
+                self.logs.append(str(payload))
+
+            elif event == "finished":
+                number, return_code = payload  # type: ignore[misc]
+                if return_code == 0:
+                    self.logs.append(f"[done] #{number}: success")
+                else:
+                    self.logs.append(
+                        f"[done] #{number}: yt-dlp exit code {return_code}"
+                    )
+
+            elif event == "notice":
+                self.logs.append(f"[yd] {payload}")
+
+    def _safe_addnstr(
+        self,
+        row: int,
+        col: int,
+        text: str,
+        width: int,
+        attr: int = 0,
+    ) -> None:
+        if width <= 0:
+            return
+        try:
+            self.screen.addnstr(row, col, text, width, attr)
+        except curses.error:
+            pass
+
+    def _draw(self) -> None:
+        height, width = self.screen.getmaxyx()
+        self.screen.erase()
+
+        if height < 8 or width < 30:
+            self._safe_addnstr(
+                0,
+                0,
+                "Terminal too small. Enlarge it to use yd.",
+                max(0, width - 1),
+                curses.A_BOLD,
+            )
+            self.screen.refresh()
+            return
+
+        state = self.worker.snapshot()
+        active_number = state["active_number"]
+        active_label = f"#{active_number}" if active_number is not None else "none"
+
+        header = (
+            f"yd queue | Active: {active_label} | Waiting: {state['waiting']} | "
+            f"Finished: {state['finished']} | Failed: {state['failed']}"
+        )
+        self._safe_addnstr(0, 0, header, width - 1, curses.A_BOLD)
+        self._safe_addnstr(
+            1,
+            0,
+            "Paste URLs anytime. Commands: status | q | Ctrl+C aborts",
+            width - 1,
+        )
+
+        separator = "─" * max(1, width - 1)
+        self._safe_addnstr(2, 0, separator, width - 1)
+
+        log_top = 3
+        input_row = height - 2
+        message_row = height - 3
+        log_height = max(1, message_row - log_top)
+
+        visible_logs = list(self.logs)[-log_height:]
+        for index, line in enumerate(visible_logs):
+            self._safe_addnstr(log_top + index, 0, line, width - 1)
+
+        self._safe_addnstr(message_row, 0, self.message, width - 1, curses.A_DIM)
+
+        prompt = "URL> "
+        self._safe_addnstr(input_row, 0, prompt, width - 1, curses.A_BOLD)
+
+        available = max(0, width - len(prompt) - 1)
+        visible_input = self.input_buffer[-available:] if available else ""
+        self._safe_addnstr(input_row, len(prompt), visible_input, available)
+
+        cursor_col = min(width - 1, len(prompt) + len(visible_input))
+        try:
+            self.screen.move(input_row, cursor_col)
+        except curses.error:
+            pass
+
+        self.screen.refresh()
+
+
+def main() -> int:
+    try:
+        ytdlp = find_ytdlp()
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 127
+
+    # Explicit arguments preserve regular one-shot yt-dlp behavior.
+    if len(sys.argv) > 1:
+        try:
+            return subprocess.run([ytdlp, *sys.argv[1:]], check=False).returncode
+        except OSError as exc:
+            print(f"ERROR: could not start yt-dlp: {exc}", file=sys.stderr)
+            return 127
+
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print("ERROR: yd queue mode requires an interactive terminal.", file=sys.stderr)
+        return 2
+
+    try:
+        return curses.wrapper(lambda screen: QueueUI(screen, ytdlp).run())
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
