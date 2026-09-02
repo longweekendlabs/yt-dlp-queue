@@ -16,9 +16,9 @@ yd
 Paste a URL and press Enter.
 While that download is running, paste another URL. It will wait in the queue.
 Commands:
-status — show queue status
-q — stop accepting URLs and finish the queue
-Ctrl+C — stop immediately
+status : show queue status
+q : stop accepting URLs and finish the queue
+Ctrl+C : stop immediately
 One-shot mode also works:
 yd "https://example.com/video"
 Requirements
