@@ -7,6 +7,13 @@ Queue mode:
 One-shot mode:
     yd "https://example.com/video"
     yd -x --audio-format mp3 "https://example.com/video"
+
+Run logs (queue mode only), in ~/.config/yt-dlp/yd-logs/:
+    yd-queue.<tag>.txt       current unfinished queue, rewritten on every change
+    yd-downloaded.<tag>.txt  appended as each URL completes
+    yd-failed.<tag>.txt      appended as each URL fails
+On exit the three files are moved to yd-logs/archive/; leftovers from an earlier
+run are archived on launch. <tag> is the launch time, YYYYMMDD-HHMMSS.
 """
 
 from __future__ import annotations
@@ -16,6 +23,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -59,10 +67,92 @@ def extract_urls(text: str) -> list[str]:
     return urls
 
 
+LOG_ROOT = Path.home() / ".config" / "yt-dlp" / "yd-logs"
+LOG_KINDS = ("queue", "downloaded", "failed")
+
+
+class RunLogs:
+    """The three live log files of one yd run, archived when the run ends."""
+
+    def __init__(self, root: Path = LOG_ROOT) -> None:
+        self.root = Path(root)
+        self.archive_dir = self.root / "archive"
+        self.tag = time.strftime("%Y%m%d-%H%M%S")
+        self.paths = {
+            kind: self.root / f"yd-{kind}.{self.tag}.txt" for kind in LOG_KINDS
+        }
+        self.lock = threading.Lock()
+
+    def prepare(self) -> None:
+        """Archive whatever the previous run left behind, then create fresh files."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.archive_dir.mkdir(parents=True, exist_ok=True)
+
+        previous = sorted(
+            path
+            for kind in LOG_KINDS
+            for path in self.root.glob(f"yd-{kind}.*.txt")
+            if path.is_file()
+        )
+        for path in previous:
+            self._move(path)
+
+        for path in self.paths.values():
+            if not path.exists():
+                path.write_text("", encoding="utf-8")
+
+    def write_queue(self, entries: list[tuple[int, str]]) -> None:
+        """Rewrite the queue file (atomically) with the still-unfinished URLs."""
+        text = "".join(f"{url}\n" for _number, url in entries)
+        with self.lock:
+            try:
+                target = self.paths["queue"]
+                temp = target.with_name(target.name + ".tmp")
+                temp.write_text(text, encoding="utf-8")
+                os.replace(temp, target)
+            except OSError:
+                pass
+
+    def append(self, kind: str, url: str, note: str = "") -> None:
+        suffix = f"  # {note}" if note else ""
+        line = f"{url}{suffix}  # {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        with self.lock:
+            try:
+                with open(self.paths[kind], "a", encoding="utf-8") as handle:
+                    handle.write(line)
+                    handle.flush()
+            except OSError:
+                pass
+
+    def archive_now(self) -> None:
+        """Move this run's three files into yd-logs/archive/."""
+        with self.lock:
+            for path in self.paths.values():
+                if path.exists():
+                    self._move(path)
+
+    def _move(self, path: Path) -> None:
+        target = self.archive_dir / path.name
+        counter = 1
+        while target.exists():
+            target = self.archive_dir / f"{path.stem}-{counter}{path.suffix}"
+            counter += 1
+        try:
+            shutil.move(str(path), str(target))
+        except OSError:
+            pass
+
+
 class QueueWorker:
-    def __init__(self, ytdlp: str, events: queue.Queue[tuple[str, object]]) -> None:
+    def __init__(
+        self,
+        ytdlp: str,
+        events: queue.Queue[tuple[str, object]],
+        runlog: RunLogs,
+    ) -> None:
         self.ytdlp = ytdlp
         self.events = events
+        self.runlog = runlog
         self.jobs: queue.Queue[object] = queue.Queue()
         self.lock = threading.Lock()
 
@@ -75,16 +165,23 @@ class QueueWorker:
         self.failed = 0
         self.accepting = True
         self.abort_requested = False
+        self.pending: dict[int, str] = {}
 
         self.thread = threading.Thread(target=self._run, name="yd-worker", daemon=True)
         self.thread.start()
+
+    def _pending_locked(self) -> list[tuple[int, str]]:
+        return sorted(self.pending.items())
 
     def add(self, url: str) -> int:
         with self.lock:
             self.total_added += 1
             number = self.total_added
+            self.pending[number] = url
+            pending = self._pending_locked()
         self.jobs.put((number, url))
         self.events.put(("queued", (number, url)))
+        self.runlog.write_queue(pending)
         return number
 
     def snapshot(self) -> dict[str, object]:
@@ -141,6 +238,12 @@ class QueueWorker:
                     break
 
         self.jobs.put(SENTINEL)
+
+        with self.lock:
+            # The queue file is deliberately left alone on abort: it keeps the URLs
+            # that were still unfinished, so the archived copy can be re-pasted
+            # into a fresh yd.
+            self.pending.clear()
 
     def _run(self) -> None:
         while True:
@@ -199,16 +302,31 @@ class QueueWorker:
                 self.finished += 1
                 if return_code != 0:
                     self.failed += 1
+                finished_url = self.pending.pop(number, url)
+                pending = self._pending_locked()
+
+            if return_code == 0:
+                self.runlog.append("downloaded", finished_url)
+            elif self.abort_requested:
+                self.runlog.append("failed", finished_url, "interrupted (aborted)")
+            else:
+                self.runlog.append("failed", finished_url, f"exit code {return_code}")
+            self.runlog.write_queue(pending)
 
             self.events.put(("finished", (number, return_code)))
             self.jobs.task_done()
 
 
 class QueueUI:
-    def __init__(self, screen: "curses._CursesWindow", ytdlp: str) -> None:
+    def __init__(
+        self,
+        screen: "curses._CursesWindow",
+        ytdlp: str,
+        runlog: RunLogs,
+    ) -> None:
         self.screen = screen
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
-        self.worker = QueueWorker(ytdlp, self.events)
+        self.worker = QueueWorker(ytdlp, self.events, runlog)
 
         self.logs: deque[str] = deque(maxlen=2000)
         self.input_buffer = ""
@@ -433,10 +551,24 @@ def main() -> int:
         print("ERROR: yd queue mode requires an interactive terminal.", file=sys.stderr)
         return 2
 
+    runlog = RunLogs()
+    runlog.prepare()
+
+    def _exit_cleanly(_signum, _frame):
+        raise KeyboardInterrupt
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _exit_cleanly)
+        except (OSError, ValueError):
+            pass
+
     try:
-        return curses.wrapper(lambda screen: QueueUI(screen, ytdlp).run())
+        return curses.wrapper(lambda screen: QueueUI(screen, ytdlp, runlog).run())
     except KeyboardInterrupt:
         return 130
+    finally:
+        runlog.archive_now()
 
 
 if __name__ == "__main__":
