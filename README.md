@@ -74,3 +74,7 @@ chmod 755 ~/.local/bin/yd
 
 `~/.local/bin` must be on your `PATH`. yt-dlp itself is expected at
 `/usr/local/bin/yt-dlp` or anywhere else on `PATH`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
