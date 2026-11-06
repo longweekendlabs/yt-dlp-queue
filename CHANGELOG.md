@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+## [0.5.0] - 2026-11-06
+
+### Added
+
+- More website support for links yt-dlp does not handle on its own.
+- Download a complete series from one episode link, preserving episode titles,
+  unique IDs, uploader/channel folders and creator metadata where available.
+  Use `yd --no-playlist "URL"` for only the pasted episode.
+- Support for additional embedded players, current quality sources and HLS streams.
+  Some web players use Deno for their signatures.
+
+### Fixed
+
+- Preserve episode metadata instead of using generic player names or missing
+  uploader folders. Track each episode separately in download history.
+- Use current player sources when page metadata points to obsolete files.
+
 ## 0.2.0
 
 - Three live log files per queue-mode run, in `~/.config/yt-dlp/yd-logs/`:

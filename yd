@@ -54,6 +54,15 @@ def find_ytdlp() -> str:
     )
 
 
+def ytdlp_command(ytdlp: str) -> list[str]:
+    """Load yd's site support in both the checkout and the installed copy."""
+    data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+    for root in (Path(__file__).resolve().parent / "plugins", data_home / "yd/plugins"):
+        if any((root / "yd/yt_dlp_plugins/extractor").glob("*.py")):
+            return [ytdlp, "--plugin-dirs", str(root)]
+    return [ytdlp]
+
+
 def extract_urls(text: str) -> list[str]:
     urls: list[str] = []
     seen: set[str] = set()
@@ -267,7 +276,7 @@ class QueueWorker:
 
             try:
                 process = subprocess.Popen(
-                    [self.ytdlp, "--newline", "--", url],
+                    [*ytdlp_command(self.ytdlp), "--newline", "--", url],
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
@@ -539,10 +548,12 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 127
 
-    # Explicit arguments preserve regular one-shot yt-dlp behavior.
+    # Use the same site support with regular one-shot yt-dlp arguments.
     if len(sys.argv) > 1:
         try:
-            return subprocess.run([ytdlp, *sys.argv[1:]], check=False).returncode
+            return subprocess.run(
+                [*ytdlp_command(ytdlp), *sys.argv[1:]], check=False,
+            ).returncode
         except OSError as exc:
             print(f"ERROR: could not start yt-dlp: {exc}", file=sys.stderr)
             return 127

@@ -22,12 +22,34 @@ and it waits in the queue.
 | `q` | stop accepting URLs and finish the queue |
 | `Ctrl+C` | stop immediately |
 
-One-shot mode passes its arguments straight to yt-dlp:
+One-shot mode accepts regular yt-dlp arguments and includes the same site support:
 
 ```bash
 yd "https://example.com/video"
 yd -x --audio-format mp3 "https://example.com/video"
 ```
+
+## Additional website support
+
+yd includes support for more websites that yt-dlp does not handle on its own.
+Paste a normal episode link to download the site's series list in order, with
+proper titles, unique IDs, uploader/channel folders and available creator metadata.
+Series grouping follows the website and can include related sequels.
+
+To download only the pasted episode, use one-shot mode:
+
+```bash
+yd --no-playlist "https://example.com/video"
+```
+
+A whole series is one queue item. The log keeps the original pasted link; if you
+interrupt a series, paste it again and your configured download archive skips
+completed episodes. Each episode has its own download-history ID.
+
+Some additional websites require Deno for their web player. yd uses the configured
+Deno runtime, one on `PATH`, or `~/.deno/bin/deno`. You can specify it with
+`--js-runtimes deno:/path/to/deno`. No additional Python packages are needed.
+Only video sources available to the current session are offered.
 
 ## Run logs
 
@@ -64,16 +86,22 @@ because there is no queue.
 - Linux
 - Python 3
 - yt-dlp on `PATH`
+- Deno for some additional websites
 
 ## Install
 
 ```bash
 cp yd ~/.local/bin/yd
 chmod 755 ~/.local/bin/yd
+mkdir -p "${XDG_DATA_HOME:-$HOME/.local/share}/yd/plugins/yd/yt_dlp_plugins/extractor"
+cp plugins/yd/yt_dlp_plugins/extractor/*.py \
+  "${XDG_DATA_HOME:-$HOME/.local/share}/yd/plugins/yd/yt_dlp_plugins/extractor/"
 ```
 
 `~/.local/bin` must be on your `PATH`. yt-dlp itself is expected at
 `/usr/local/bin/yt-dlp` or anywhere else on `PATH`.
+Copy both the script and plugins when updating. The plugins are loaded by yd;
+running yd from this checkout uses the checkout's plugins automatically.
 
 ## License
 
